@@ -70,9 +70,11 @@ TIME_EASE_INTERVAL_SEC = int(os.environ.get("TIME_EASE_INTERVAL_SEC", str(2 * 60
 TIME_EASE_SLEEP_SEC = float(os.environ.get("TIME_EASE_SLEEP_SEC", "10"))  # default 10 seconds
 
 # -------- Global rate limit controls --------
-# Enforce a minimum gap between ANY SEC HTTP requests to avoid 429.
-MIN_REQUEST_INTERVAL_SEC = float(os.environ.get("MIN_REQUEST_INTERVAL_SEC", "0.4"))  # ~2.5 req/sec
+# Enforce a minimum gap between ANY SEC HTTP requests to avoid abuse/blocks.
+# Default: 1 request/sec (very conservative).
+MIN_REQUEST_INTERVAL_SEC = float(os.environ.get("MIN_REQUEST_INTERVAL_SEC", "1.0"))
 MAX_429_RETRIES = int(os.environ.get("MAX_429_RETRIES", "5"))
+MAX_403_RETRIES = int(os.environ.get("MAX_403_RETRIES", "2"))
 
 WORD_REGEX = re.compile(r"[a-zA-Z]+")
 
@@ -138,6 +140,7 @@ def make_sec_session() -> requests.Session:
     sess.headers.update({
         "User-Agent": SEC_USER_AGENT,
         "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
     })
     return sess
 
@@ -148,15 +151,16 @@ def sec_get(
     timeout: float = 30.0,
 ) -> Optional[requests.Response]:
     """
-    Rate-limited GET wrapper with 429 (Too Many Requests) handling.
+    Rate-limited GET wrapper with 429 (Too Many Requests) and 403 handling.
 
     - Enforces MIN_REQUEST_INTERVAL_SEC between ANY two calls
-    - On status 429, respects 'Retry-After' if present, otherwise exponential backoff
-    - Retries up to MAX_429_RETRIES times
+    - On 429 or (403 with Retry-After), uses backoff & retry
+    - On "hard" 403 without Retry-After, fails fast (no endless hammering)
     """
     global LAST_REQUEST_TIME
 
     retries_429 = 0
+    retries_403 = 0
 
     while True:
         # Enforce minimum spacing across all SEC requests
@@ -174,31 +178,57 @@ def sec_get(
             return None
 
         LAST_REQUEST_TIME = time.time()
-
         status = resp.status_code
 
-        # Handle 429 with backoff
-        if status == 429:
-            retries_429 += 1
-            if retries_429 > MAX_429_RETRIES:
-                print(f"[ERROR] GET {url}: 429 Too Many Requests after {MAX_429_RETRIES} retries.")
+        # Handle 429 and 403 with limited retries
+        if status in (429, 403):
+            retry_after = resp.headers.get("Retry-After")
+            label = "429 Too Many Requests" if status == 429 else "403 Forbidden"
+
+            if status == 429:
+                retries_429 += 1
+                retries = retries_429
+                max_retries = MAX_429_RETRIES
+            else:
+                retries_403 += 1
+                retries = retries_403
+                max_retries = MAX_403_RETRIES
+
+            if retries > max_retries:
+                print(f"[ERROR] GET {url}: {label} after {max_retries} retries.")
                 return None
 
-            retry_after = resp.headers.get("Retry-After")
+            # If Retry-After is present, SEC is telling us explicitly how long to wait.
             if retry_after is not None:
                 try:
                     wait = float(retry_after)
                 except ValueError:
-                    wait = min(60.0, 2.0 ** retries_429)
-            else:
-                wait = min(60.0, 2.0 ** retries_429)
+                    wait = min(300.0, 2.0 ** retries)
+                print(
+                    f"[WARN] {label} for {url}; "
+                    f"Retry-After={retry_after}, sleeping {wait:.1f}s (retry {retries})..."
+                )
+                time.sleep(wait)
+                continue
 
-            print(
-                f"[WARN] 429 Too Many Requests for {url}; "
-                f"sleeping {wait:.1f} seconds before retry {retries_429}..."
-            )
-            time.sleep(wait)
-            continue  # retry the loop
+            # 403 without Retry-After is usually a "hard" forbidden (UA/IP/etc.)
+            if status == 403:
+                print(
+                    f"[ERROR] GET {url}: 403 Forbidden without Retry-After. "
+                    f"This usually indicates a User-Agent or IP/access issue, "
+                    f"not something code can fix by retrying."
+                )
+                return None
+
+            # 429 without Retry-After: use exponential backoff
+            if status == 429:
+                wait = min(300.0, 2.0 ** retries)
+                print(
+                    f"[WARN] 429 Too Many Requests for {url}; "
+                    f"sleeping {wait:.1f}s (retry {retries})..."
+                )
+                time.sleep(wait)
+                continue
 
         # Optionally, we could retry some 5xx codes; for now, just log and return
         if 500 <= status < 600:
