@@ -55,7 +55,7 @@ SEC_USER_AGENT = os.environ.get(
 # Max number of 10-K filings per company to process
 MAX_10K_PER_COMPANY = int(os.environ.get("MAX_10K_PER_COMPANY", "10"))
 
-# Small sleep between filings to be polite to SEC
+# Small sleep between filings to be polite to SEC (per filing)
 SLEEP_BETWEEN_FILINGS_SEC = float(os.environ.get("SLEEP_BETWEEN_FILINGS_SEC", "0.2"))
 
 # Optional external keyword file (one term per line)
@@ -68,6 +68,11 @@ CLIMATE_KEYWORD_PATH = os.environ.get(
 # Run for TIME_EASE_INTERVAL_SEC, then flush + sleep TIME_EASE_SLEEP_SEC, then continue.
 TIME_EASE_INTERVAL_SEC = int(os.environ.get("TIME_EASE_INTERVAL_SEC", str(2 * 60 * 60)))  # default 2 hours
 TIME_EASE_SLEEP_SEC = float(os.environ.get("TIME_EASE_SLEEP_SEC", "10"))  # default 10 seconds
+
+# -------- Global rate limit controls --------
+# Enforce a minimum gap between ANY SEC HTTP requests to avoid 429.
+MIN_REQUEST_INTERVAL_SEC = float(os.environ.get("MIN_REQUEST_INTERVAL_SEC", "0.4"))  # ~2.5 req/sec
+MAX_429_RETRIES = int(os.environ.get("MAX_429_RETRIES", "5"))
 
 WORD_REGEX = re.compile(r"[a-zA-Z]+")
 
@@ -109,6 +114,9 @@ BASELINE_CLIMATE_KEYWORDS: List[str] = [
 
 CLIMATE_KEYWORDS: List[str] = BASELINE_CLIMATE_KEYWORDS.copy()
 
+# Global timestamp of last SEC request
+LAST_REQUEST_TIME: Optional[float] = None
+
 
 # ========== BASIC HELPERS ==========
 
@@ -130,9 +138,74 @@ def make_sec_session() -> requests.Session:
     sess.headers.update({
         "User-Agent": SEC_USER_AGENT,
         "Accept-Encoding": "gzip, deflate",
-        "Host": "data.sec.gov",
     })
     return sess
+
+
+def sec_get(
+    session: requests.Session,
+    url: str,
+    timeout: float = 30.0,
+) -> Optional[requests.Response]:
+    """
+    Rate-limited GET wrapper with 429 (Too Many Requests) handling.
+
+    - Enforces MIN_REQUEST_INTERVAL_SEC between ANY two calls
+    - On status 429, respects 'Retry-After' if present, otherwise exponential backoff
+    - Retries up to MAX_429_RETRIES times
+    """
+    global LAST_REQUEST_TIME
+
+    retries_429 = 0
+
+    while True:
+        # Enforce minimum spacing across all SEC requests
+        now = time.time()
+        if LAST_REQUEST_TIME is not None:
+            delta = now - LAST_REQUEST_TIME
+            if delta < MIN_REQUEST_INTERVAL_SEC:
+                sleep_for = MIN_REQUEST_INTERVAL_SEC - delta
+                time.sleep(max(sleep_for, 0.0))
+
+        try:
+            resp = session.get(url, timeout=timeout)
+        except Exception as e:
+            print(f"[ERROR] GET {url}: {e}")
+            return None
+
+        LAST_REQUEST_TIME = time.time()
+
+        status = resp.status_code
+
+        # Handle 429 with backoff
+        if status == 429:
+            retries_429 += 1
+            if retries_429 > MAX_429_RETRIES:
+                print(f"[ERROR] GET {url}: 429 Too Many Requests after {MAX_429_RETRIES} retries.")
+                return None
+
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after is not None:
+                try:
+                    wait = float(retry_after)
+                except ValueError:
+                    wait = min(60.0, 2.0 ** retries_429)
+            else:
+                wait = min(60.0, 2.0 ** retries_429)
+
+            print(
+                f"[WARN] 429 Too Many Requests for {url}; "
+                f"sleeping {wait:.1f} seconds before retry {retries_429}..."
+            )
+            time.sleep(wait)
+            continue  # retry the loop
+
+        # Optionally, we could retry some 5xx codes; for now, just log and return
+        if 500 <= status < 600:
+            print(f"[WARN] GET {url}: server error {status}")
+            return resp
+
+        return resp
 
 
 def load_climate_keywords(path: str) -> List[str]:
@@ -168,14 +241,19 @@ def fetch_company_submissions(
     """
     cik_padded = cik.zfill(10)
     url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
+    resp = sec_get(session, url, timeout=30.0)
+    if resp is None:
+        print(f"[ERROR] CIK {cik}: submissions.json request failed.")
+        return None
+
+    if resp.status_code != 200:
+        print(f"[WARN] CIK {cik}: submissions.json status {resp.status_code}")
+        return None
+
     try:
-        resp = session.get(url, timeout=30)
-        if resp.status_code != 200:
-            print(f"[WARN] CIK {cik}: submissions.json status {resp.status_code}")
-            return None
         return resp.json()
     except Exception as e:
-        print(f"[ERROR] CIK {cik}: error fetching submissions.json: {e}")
+        print(f"[ERROR] CIK {cik}: error parsing submissions.json: {e}")
         return None
 
 
@@ -228,27 +306,27 @@ def fetch_filing_text(session: requests.Session, url: str) -> Optional[str]:
     """
     Download a filing document (HTML or TXT) and return plain text.
     """
-    # Switch Host header for www.sec.gov
-    session.headers.update({"Host": "www.sec.gov"})
-    try:
-        resp = session.get(url, timeout=60)
-        if resp.status_code != 200:
-            print(f"[WARN] Filing URL {url} status {resp.status_code}")
-            return None
-        text = resp.text
-        content_type = resp.headers.get("Content-Type", "").lower()
+    resp = sec_get(session, url, timeout=60.0)
+    if resp is None:
+        print(f"[ERROR] Filing URL {url}: request failed.")
+        return None
 
+    if resp.status_code != 200:
+        print(f"[WARN] Filing URL {url} status {resp.status_code}")
+        return None
+
+    text = resp.text
+    content_type = resp.headers.get("Content-Type", "").lower()
+
+    try:
         if "html" in content_type or "<html" in text.lower():
             soup = BeautifulSoup(text, "lxml")
             return soup.get_text(separator=" ", strip=True)
         else:
             return text
     except Exception as e:
-        print(f"[ERROR] Filing URL {url}: error {e}")
+        print(f"[ERROR] Parsing filing HTML/TXT at {url}: {e}")
         return None
-    finally:
-        # Restore Host header for JSON API
-        session.headers.update({"Host": "data.sec.gov"})
 
 
 def extract_risk_factor_section(full_text: str) -> str:
@@ -496,7 +574,7 @@ def main():
                     f"[INFO] Time-ease: elapsed {elapsed/3600:.2f} hours "
                     f"since start. Flushing and sleeping for {TIME_EASE_SLEEP_SEC} seconds..."
                 )
-                gzfile.flush()  # ensure OS gets all buffered data
+                gzfile.flush()
                 time.sleep(TIME_EASE_SLEEP_SEC)
                 last_pause_time = time.time()
             # ------------------------------------------------------
