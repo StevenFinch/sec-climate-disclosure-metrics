@@ -1,0 +1,50 @@
+name: Build SEC climate disclosure metrics
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Every day at 06:00 UTC; adjust as desired
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Run SEC climate metrics pipeline
+        env:
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          ISSUER_MASTER_PATH: clean_data/issuer_master.csv
+          OUTPUT_METRICS_PATH: clean_data/sec_climate_disclosure_metrics.csv.gz
+        run: |
+          python build_sec_climate_metrics.py
+
+      - name: Upload metrics as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sec_climate_disclosure_metrics
+          path: clean_data/sec_climate_disclosure_metrics.csv.gz
+
+      - name: Commit updated metrics (optional)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add clean_data/sec_climate_disclosure_metrics.csv.gz || true
+          git commit -m "Update SEC climate disclosure metrics [skip ci]" || echo "No changes to commit"
+          git push || echo "No changes pushed"
