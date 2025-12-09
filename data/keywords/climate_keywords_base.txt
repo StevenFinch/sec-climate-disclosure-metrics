@@ -1,0 +1,33 @@
+# Baseline climate- and transition-related keywords for SEC 10-Ks
+# One term per line; case-insensitive; simple substring / token matches.
+climate
+climate change
+climatic
+climate risk
+transition risk
+physical risk
+global warming
+greenhouse
+greenhouse gas
+ghg
+carbon
+carbon dioxide
+co2
+emission
+emissions
+net zero
+decarbonization
+decarbonisation
+sea level
+sea-level rise
+flood
+flooding
+wildfire
+heatwave
+heat wave
+extreme weather
+hurricane
+typhoon
+drought
+storm surge
+temperature rise
