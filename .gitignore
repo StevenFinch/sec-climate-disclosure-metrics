@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# Data outputs
+clean_data/*.csv
+clean_data/*.csv.gz
+clean_data/*.parquet
+
+# Misc
+.DS_Store
