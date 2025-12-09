@@ -64,6 +64,11 @@ CLIMATE_KEYWORD_PATH = os.environ.get(
     "data/keywords/climate_keywords_base.txt",
 )
 
+# -------- Time-ease controls --------
+# Run for TIME_EASE_INTERVAL_SEC, then flush + sleep TIME_EASE_SLEEP_SEC, then continue.
+TIME_EASE_INTERVAL_SEC = int(os.environ.get("TIME_EASE_INTERVAL_SEC", str(2 * 60 * 60)))  # default 2 hours
+TIME_EASE_SLEEP_SEC = float(os.environ.get("TIME_EASE_SLEEP_SEC", "10"))  # default 10 seconds
+
 WORD_REGEX = re.compile(r"[a-zA-Z]+")
 
 
@@ -440,6 +445,10 @@ def main():
     # 1.5 Create shared SEC session
     session = make_sec_session()
 
+    # Time-ease timers
+    start_time = time.time()
+    last_pause_time = start_time
+
     # 2. Prepare writer
     ensure_dir(OUTPUT_METRICS_PATH)
     fieldnames = [
@@ -478,6 +487,20 @@ def main():
         total_firms = len(issuer_dict)
         for idx, (cik, static_info) in enumerate(issuer_dict.items(), start=1):
             print(f"\n[INFO] === Firm {idx}/{total_firms} | CIK {cik} ===")
+
+            # ---- time-ease check (every ~2 hours by default) ----
+            now = time.time()
+            if now - last_pause_time >= TIME_EASE_INTERVAL_SEC:
+                elapsed = now - start_time
+                print(
+                    f"[INFO] Time-ease: elapsed {elapsed/3600:.2f} hours "
+                    f"since start. Flushing and sleeping for {TIME_EASE_SLEEP_SEC} seconds..."
+                )
+                gzfile.flush()  # ensure OS gets all buffered data
+                time.sleep(TIME_EASE_SLEEP_SEC)
+                last_pause_time = time.time()
+            # ------------------------------------------------------
+
             try:
                 for row in iter_company_climate_rows(cik, static_info, session):
                     writer.writerow(row)
