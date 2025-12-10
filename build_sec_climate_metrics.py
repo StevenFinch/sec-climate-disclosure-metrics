@@ -74,7 +74,10 @@ TIME_EASE_SLEEP_SEC = float(os.environ.get("TIME_EASE_SLEEP_SEC", "10"))  # defa
 # Default: 1 request/sec (very conservative).
 MIN_REQUEST_INTERVAL_SEC = float(os.environ.get("MIN_REQUEST_INTERVAL_SEC", "1.0"))
 MAX_429_RETRIES = int(os.environ.get("MAX_429_RETRIES", "5"))
-MAX_403_RETRIES = int(os.environ.get("MAX_403_RETRIES", "2"))
+
+# -------- 403 safety controls --------
+# How many 403s on submissions.json we tolerate before deciding we're probably blocked
+SUBMISSION_403_LIMIT = int(os.environ.get("SUBMISSION_403_LIMIT", "50"))
 
 WORD_REGEX = re.compile(r"[a-zA-Z]+")
 
@@ -119,6 +122,9 @@ CLIMATE_KEYWORDS: List[str] = BASELINE_CLIMATE_KEYWORDS.copy()
 # Global timestamp of last SEC request
 LAST_REQUEST_TIME: Optional[float] = None
 
+# Global counter for consecutive 403 on submissions
+SUBMISSION_403_COUNT: int = 0
+
 
 # ========== BASIC HELPERS ==========
 
@@ -151,16 +157,15 @@ def sec_get(
     timeout: float = 30.0,
 ) -> Optional[requests.Response]:
     """
-    Rate-limited GET wrapper with 429 (Too Many Requests) and 403 handling.
+    Rate-limited GET wrapper with 429 (Too Many Requests) handling.
 
     - Enforces MIN_REQUEST_INTERVAL_SEC between ANY two calls
-    - On 429 or (403 with Retry-After), uses backoff & retry
-    - On "hard" 403 without Retry-After, fails fast (no endless hammering)
+    - On 429 uses backoff & retry
+    - All other statuses (including 403) are just returned; callers decide.
     """
     global LAST_REQUEST_TIME
 
     retries_429 = 0
-    retries_403 = 0
 
     while True:
         # Enforce minimum spacing across all SEC requests
@@ -180,61 +185,30 @@ def sec_get(
         LAST_REQUEST_TIME = time.time()
         status = resp.status_code
 
-        # Handle 429 and 403 with limited retries
-        if status in (429, 403):
-            retry_after = resp.headers.get("Retry-After")
-            label = "429 Too Many Requests" if status == 429 else "403 Forbidden"
-
-            if status == 429:
-                retries_429 += 1
-                retries = retries_429
-                max_retries = MAX_429_RETRIES
-            else:
-                retries_403 += 1
-                retries = retries_403
-                max_retries = MAX_403_RETRIES
-
-            if retries > max_retries:
-                print(f"[ERROR] GET {url}: {label} after {max_retries} retries.")
+        # Handle 429 with backoff
+        if status == 429:
+            retries_429 += 1
+            if retries_429 > MAX_429_RETRIES:
+                print(f"[ERROR] GET {url}: 429 Too Many Requests after {MAX_429_RETRIES} retries.")
                 return None
 
-            # If Retry-After is present, SEC is telling us explicitly how long to wait.
+            retry_after = resp.headers.get("Retry-After")
             if retry_after is not None:
                 try:
                     wait = float(retry_after)
                 except ValueError:
-                    wait = min(300.0, 2.0 ** retries)
-                print(
-                    f"[WARN] {label} for {url}; "
-                    f"Retry-After={retry_after}, sleeping {wait:.1f}s (retry {retries})..."
-                )
-                time.sleep(wait)
-                continue
+                    wait = min(300.0, 2.0 ** retries_429)
+            else:
+                wait = min(300.0, 2.0 ** retries_429)
 
-            # 403 without Retry-After is usually a "hard" forbidden (UA/IP/etc.)
-            if status == 403:
-                print(
-                    f"[ERROR] GET {url}: 403 Forbidden without Retry-After. "
-                    f"This usually indicates a User-Agent or IP/access issue, "
-                    f"not something code can fix by retrying."
-                )
-                return None
+            print(
+                f"[WARN] 429 Too Many Requests for {url}; "
+                f"sleeping {wait:.1f}s (retry {retries_429})..."
+            )
+            time.sleep(wait)
+            continue
 
-            # 429 without Retry-After: use exponential backoff
-            if status == 429:
-                wait = min(300.0, 2.0 ** retries)
-                print(
-                    f"[WARN] 429 Too Many Requests for {url}; "
-                    f"sleeping {wait:.1f}s (retry {retries})..."
-                )
-                time.sleep(wait)
-                continue
-
-        # Optionally, we could retry some 5xx codes; for now, just log and return
-        if 500 <= status < 600:
-            print(f"[WARN] GET {url}: server error {status}")
-            return resp
-
+        # No special handling for 403 or 5xx here; caller decides.
         return resp
 
 
@@ -269,15 +243,36 @@ def fetch_company_submissions(
     Download the SEC submissions JSON for a given CIK (10-digit string).
     Returns dict or None on error.
     """
+    global SUBMISSION_403_COUNT
+
     cik_padded = cik.zfill(10)
     url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
     resp = sec_get(session, url, timeout=30.0)
     if resp is None:
-        print(f"[ERROR] CIK {cik}: submissions.json request failed.")
+        print(f"[ERROR] CIK {cik}: submissions.json request failed (no response).")
         return None
 
-    if resp.status_code != 200:
-        print(f"[WARN] CIK {cik}: submissions.json status {resp.status_code}")
+    status = resp.status_code
+
+    # Handle 403 specifically here (soft-skip this issuer, but detect global block)
+    if status == 403:
+        SUBMISSION_403_COUNT += 1
+        print(
+            f"[WARN] CIK {cik}: submissions.json returned 403 Forbidden "
+            f"(consecutive 403 count = {SUBMISSION_403_COUNT}). Skipping this issuer."
+        )
+        if SUBMISSION_403_COUNT >= SUBMISSION_403_LIMIT:
+            raise RuntimeError(
+                f"Hit {SUBMISSION_403_COUNT} consecutive 403s from data.sec.gov. "
+                "Likely IP/User-Agent block; stopping to avoid hammering SEC."
+            )
+        return None
+
+    # Reset 403 streak on any non-403 response
+    SUBMISSION_403_COUNT = 0
+
+    if status != 200:
+        print(f"[WARN] CIK {cik}: submissions.json status {status}")
         return None
 
     try:
@@ -341,8 +336,13 @@ def fetch_filing_text(session: requests.Session, url: str) -> Optional[str]:
         print(f"[ERROR] Filing URL {url}: request failed.")
         return None
 
-    if resp.status_code != 200:
-        print(f"[WARN] Filing URL {url} status {resp.status_code}")
+    status = resp.status_code
+    if status == 403:
+        print(f"[WARN] Filing URL {url} returned 403 Forbidden. Skipping this filing.")
+        return None
+
+    if status != 200:
+        print(f"[WARN] Filing URL {url} status {status}")
         return None
 
     text = resp.text
@@ -450,6 +450,7 @@ def iter_company_climate_rows(
     """
     submissions = fetch_company_submissions(session, cik)
     if submissions is None:
+        # already logged; just skip this issuer
         return
 
     filings_10k = extract_10k_filings(submissions)
@@ -593,28 +594,33 @@ def main():
         writer.writeheader()
 
         total_firms = len(issuer_dict)
-        for idx, (cik, static_info) in enumerate(issuer_dict.items(), start=1):
-            print(f"\n[INFO] === Firm {idx}/{total_firms} | CIK {cik} ===")
+        try:
+            for idx, (cik, static_info) in enumerate(issuer_dict.items(), start=1):
+                print(f"\n[INFO] === Firm {idx}/{total_firms} | CIK {cik} ===")
 
-            # ---- time-ease check (every ~2 hours by default) ----
-            now = time.time()
-            if now - last_pause_time >= TIME_EASE_INTERVAL_SEC:
-                elapsed = now - start_time
-                print(
-                    f"[INFO] Time-ease: elapsed {elapsed/3600:.2f} hours "
-                    f"since start. Flushing and sleeping for {TIME_EASE_SLEEP_SEC} seconds..."
-                )
-                gzfile.flush()
-                time.sleep(TIME_EASE_SLEEP_SEC)
-                last_pause_time = time.time()
-            # ------------------------------------------------------
+                # ---- time-ease check (every ~2 hours by default) ----
+                now = time.time()
+                if now - last_pause_time >= TIME_EASE_INTERVAL_SEC:
+                    elapsed = now - start_time
+                    print(
+                        f"[INFO] Time-ease: elapsed {elapsed/3600:.2f} hours "
+                        f"since start. Flushing and sleeping for {TIME_EASE_SLEEP_SEC} seconds..."
+                    )
+                    gzfile.flush()
+                    time.sleep(TIME_EASE_SLEEP_SEC)
+                    last_pause_time = time.time()
+                # ------------------------------------------------------
 
-            try:
-                for row in iter_company_climate_rows(cik, static_info, session):
-                    writer.writerow(row)
-            except Exception as e:
-                print(f"[ERROR] CIK {cik}: unexpected error {e}")
-                continue
+                try:
+                    for row in iter_company_climate_rows(cik, static_info, session):
+                        writer.writerow(row)
+                except Exception as e:
+                    print(f"[ERROR] CIK {cik}: unexpected error {e}")
+                    continue
+        except RuntimeError as e:
+            # This is triggered if we hit too many 403s in a row on submissions
+            print(f"[ERROR] {e}")
+            print("[INFO] Stopping early to avoid hammering SEC; partial metrics file is still saved.")
 
     print(f"[INFO] Done. Climate metrics saved to {OUTPUT_METRICS_PATH}")
 
