@@ -15,8 +15,7 @@ Designed for:
 - Very low RAM: no large DataFrame kept; process company-by-company.
 - Very low disk: only small metrics file is saved, no full filings.
 
-You MUST set SEC_USER_AGENT to your info before running
-(see README for details).
+You MUST set SEC_USER_AGENT to your info before running.
 """
 
 import csv
@@ -32,98 +31,40 @@ import requests
 from bs4 import BeautifulSoup
 
 
-# ========== CONFIG (CAN BE OVERRIDDEN BY ENV) ==========
+# ========== CONFIG (EDIT THESE) ==========
 
 # Path to issuer master (step 1 output)
-ISSUER_MASTER_PATH = os.environ.get(
-    "ISSUER_MASTER_PATH",
-    "clean_data/issuer_master.csv",  # or ".csv.gz"
-)
+ISSUER_MASTER_PATH = "clean_data/issuer_master.csv"  # or ".csv.gz"
 
 # Output metrics (gzipped CSV)
-OUTPUT_METRICS_PATH = os.environ.get(
-    "OUTPUT_METRICS_PATH",
-    "clean_data/sec_climate_disclosure_metrics.csv.gz",
-)
+OUTPUT_METRICS_PATH = "clean_data/sec_climate_disclosure_metrics.csv.gz"
 
-# SEC requires a descriptive User-Agent. CHANGE THIS or set SEC_USER_AGENT env.
-SEC_USER_AGENT = os.environ.get(
-    "SEC_USER_AGENT",
-    "CHANGE-ME Your Name Your Affiliation you@example.com",
-)
+# SEC requires a descriptive User-Agent. CHANGE THIS.
+SEC_USER_AGENT = "Sirui Zhao Cornell University sz695@cornell.edu"
 
 # Max number of 10-K filings per company to process
-MAX_10K_PER_COMPANY = int(os.environ.get("MAX_10K_PER_COMPANY", "10"))
+MAX_10K_PER_COMPANY = 10
 
-# Small sleep between filings to be polite to SEC (per filing)
-SLEEP_BETWEEN_FILINGS_SEC = float(os.environ.get("SLEEP_BETWEEN_FILINGS_SEC", "0.2"))
+# Small sleep between filings to be polite to SEC
+SLEEP_BETWEEN_FILINGS_SEC = 0.2
 
-# Optional external keyword file (one term per line)
-CLIMATE_KEYWORD_PATH = os.environ.get(
-    "CLIMATE_KEYWORD_PATH",
-    "data/keywords/climate_keywords_base.txt",
-)
-
-# -------- Time-ease controls --------
-# Run for TIME_EASE_INTERVAL_SEC, then flush + sleep TIME_EASE_SLEEP_SEC, then continue.
-TIME_EASE_INTERVAL_SEC = int(os.environ.get("TIME_EASE_INTERVAL_SEC", str(2 * 60 * 60)))  # default 2 hours
-TIME_EASE_SLEEP_SEC = float(os.environ.get("TIME_EASE_SLEEP_SEC", "10"))  # default 10 seconds
-
-# -------- Global rate limit controls --------
-# Enforce a minimum gap between ANY SEC HTTP requests to avoid abuse/blocks.
-# Default: 1 request/sec (very conservative).
-MIN_REQUEST_INTERVAL_SEC = float(os.environ.get("MIN_REQUEST_INTERVAL_SEC", "1.0"))
-MAX_429_RETRIES = int(os.environ.get("MAX_429_RETRIES", "5"))
-
-# -------- 403 safety controls --------
-# How many 403s on submissions.json we tolerate before deciding we're probably blocked
-SUBMISSION_403_LIMIT = int(os.environ.get("SUBMISSION_403_LIMIT", "50"))
-
-WORD_REGEX = re.compile(r"[a-zA-Z]+")
-
-
-# Baseline keywords (used if external file is missing)
-BASELINE_CLIMATE_KEYWORDS: List[str] = [
+# Climate-related keywords / phrases (simple baseline; can be refined later)
+CLIMATE_KEYWORDS = [
     "climate",
-    "climate change",
-    "climatic",
-    "global warming",
-    "climate risk",
-    "transition risk",
-    "physical risk",
-    "greenhouse",
-    "greenhouse gas",
-    "ghg",
-    "carbon",
-    "carbon dioxide",
-    "co2",
     "emission",
     "emissions",
+    "carbon",
+    "co2",
+    "greenhouse",
+    "ghg",
+    "global warming",
     "net zero",
     "decarbonization",
     "decarbonisation",
-    "sea level",
-    "sea-level rise",
-    "flood",
-    "flooding",
-    "wildfire",
-    "heatwave",
-    "heat wave",
-    "extreme weather",
-    "hurricane",
-    "typhoon",
-    "drought",
-    "storm surge",
-    "temperature rise",
+    "climate change",
 ]
 
-CLIMATE_KEYWORDS: List[str] = BASELINE_CLIMATE_KEYWORDS.copy()
-
-# Global timestamp of last SEC request
-LAST_REQUEST_TIME: Optional[float] = None
-
-# Global counter for consecutive 403 on submissions
-SUBMISSION_403_COUNT: int = 0
+WORD_REGEX = re.compile(r"[a-zA-Z]+")
 
 
 # ========== BASIC HELPERS ==========
@@ -136,149 +77,30 @@ def ensure_dir(path: str) -> None:
 
 def make_sec_session() -> requests.Session:
     """Create a requests session with proper SEC headers."""
-    if "CHANGE-ME" in SEC_USER_AGENT:
-        raise RuntimeError(
-            "Please set SEC_USER_AGENT env var to something like "
-            "'Your Name Your Affiliation you@example.com'."
-        )
-
     sess = requests.Session()
     sess.headers.update({
         "User-Agent": SEC_USER_AGENT,
         "Accept-Encoding": "gzip, deflate",
-        "Accept": "*/*",
+        "Host": "data.sec.gov",
     })
     return sess
 
 
-def sec_get(
-    session: requests.Session,
-    url: str,
-    timeout: float = 30.0,
-) -> Optional[requests.Response]:
-    """
-    Rate-limited GET wrapper with 429 (Too Many Requests) handling.
-
-    - Enforces MIN_REQUEST_INTERVAL_SEC between ANY two calls
-    - On 429 uses backoff & retry
-    - All other statuses (including 403) are just returned; callers decide.
-    """
-    global LAST_REQUEST_TIME
-
-    retries_429 = 0
-
-    while True:
-        # Enforce minimum spacing across all SEC requests
-        now = time.time()
-        if LAST_REQUEST_TIME is not None:
-            delta = now - LAST_REQUEST_TIME
-            if delta < MIN_REQUEST_INTERVAL_SEC:
-                sleep_for = MIN_REQUEST_INTERVAL_SEC - delta
-                time.sleep(max(sleep_for, 0.0))
-
-        try:
-            resp = session.get(url, timeout=timeout)
-        except Exception as e:
-            print(f"[ERROR] GET {url}: {e}")
-            return None
-
-        LAST_REQUEST_TIME = time.time()
-        status = resp.status_code
-
-        # Handle 429 with backoff
-        if status == 429:
-            retries_429 += 1
-            if retries_429 > MAX_429_RETRIES:
-                print(f"[ERROR] GET {url}: 429 Too Many Requests after {MAX_429_RETRIES} retries.")
-                return None
-
-            retry_after = resp.headers.get("Retry-After")
-            if retry_after is not None:
-                try:
-                    wait = float(retry_after)
-                except ValueError:
-                    wait = min(300.0, 2.0 ** retries_429)
-            else:
-                wait = min(300.0, 2.0 ** retries_429)
-
-            print(
-                f"[WARN] 429 Too Many Requests for {url}; "
-                f"sleeping {wait:.1f}s (retry {retries_429})..."
-            )
-            time.sleep(wait)
-            continue
-
-        # No special handling for 403 or 5xx here; caller decides.
-        return resp
-
-
-def load_climate_keywords(path: str) -> List[str]:
-    """
-    Load climate keywords from a text file (one per line).
-    Lines starting with '#' are comments. If file is missing,
-    fall back to BASELINE_CLIMATE_KEYWORDS.
-    """
-    p = Path(path)
-    if not p.is_file():
-        print(f"[WARN] Keyword file {p} not found; using built-in baseline list.")
-        return BASELINE_CLIMATE_KEYWORDS.copy()
-
-    keywords: List[str] = []
-    with p.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            keywords.append(line.lower())
-
-    print(f"[INFO] Loaded {len(keywords)} climate keywords from {p}")
-    return keywords
-
-
-def fetch_company_submissions(
-    session: requests.Session,
-    cik: str,
-) -> Optional[Dict]:
+def fetch_company_submissions(session: requests.Session, cik: str) -> Optional[Dict]:
     """
     Download the SEC submissions JSON for a given CIK (10-digit string).
     Returns dict or None on error.
     """
-    global SUBMISSION_403_COUNT
-
     cik_padded = cik.zfill(10)
     url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
-    resp = sec_get(session, url, timeout=30.0)
-    if resp is None:
-        print(f"[ERROR] CIK {cik}: submissions.json request failed (no response).")
-        return None
-
-    status = resp.status_code
-
-    # Handle 403 specifically here (soft-skip this issuer, but detect global block)
-    if status == 403:
-        SUBMISSION_403_COUNT += 1
-        print(
-            f"[WARN] CIK {cik}: submissions.json returned 403 Forbidden "
-            f"(consecutive 403 count = {SUBMISSION_403_COUNT}). Skipping this issuer."
-        )
-        if SUBMISSION_403_COUNT >= SUBMISSION_403_LIMIT:
-            raise RuntimeError(
-                f"Hit {SUBMISSION_403_COUNT} consecutive 403s from data.sec.gov. "
-                "Likely IP/User-Agent block; stopping to avoid hammering SEC."
-            )
-        return None
-
-    # Reset 403 streak on any non-403 response
-    SUBMISSION_403_COUNT = 0
-
-    if status != 200:
-        print(f"[WARN] CIK {cik}: submissions.json status {status}")
-        return None
-
     try:
+        resp = session.get(url, timeout=30)
+        if resp.status_code != 200:
+            print(f"[WARN] CIK {cik}: submissions.json status {resp.status_code}")
+            return None
         return resp.json()
     except Exception as e:
-        print(f"[ERROR] CIK {cik}: error parsing submissions.json: {e}")
+        print(f"[ERROR] CIK {cik}: error fetching submissions.json: {e}")
         return None
 
 
@@ -331,32 +153,27 @@ def fetch_filing_text(session: requests.Session, url: str) -> Optional[str]:
     """
     Download a filing document (HTML or TXT) and return plain text.
     """
-    resp = sec_get(session, url, timeout=60.0)
-    if resp is None:
-        print(f"[ERROR] Filing URL {url}: request failed.")
-        return None
-
-    status = resp.status_code
-    if status == 403:
-        print(f"[WARN] Filing URL {url} returned 403 Forbidden. Skipping this filing.")
-        return None
-
-    if status != 200:
-        print(f"[WARN] Filing URL {url} status {status}")
-        return None
-
-    text = resp.text
-    content_type = resp.headers.get("Content-Type", "").lower()
-
+    # Switch Host header for www.sec.gov
+    session.headers.update({"Host": "www.sec.gov"})
     try:
+        resp = session.get(url, timeout=60)
+        if resp.status_code != 200:
+            print(f"[WARN] Filing URL {url} status {resp.status_code}")
+            return None
+        text = resp.text
+        content_type = resp.headers.get("Content-Type", "").lower()
+
         if "html" in content_type or "<html" in text.lower():
             soup = BeautifulSoup(text, "lxml")
             return soup.get_text(separator=" ", strip=True)
         else:
             return text
     except Exception as e:
-        print(f"[ERROR] Parsing filing HTML/TXT at {url}: {e}")
+        print(f"[ERROR] Filing URL {url}: error {e}")
         return None
+    finally:
+        # Restore Host header for JSON API
+        session.headers.update({"Host": "data.sec.gov"})
 
 
 def extract_risk_factor_section(full_text: str) -> str:
@@ -412,6 +229,7 @@ def compute_climate_metrics(text: str) -> Dict[str, float]:
     multi_phrases = [kw for kw in CLIMATE_KEYWORDS if " " in kw]
 
     keyword_count = 0
+    # naive count of occurrences of each single keyword
     for kw in single_words:
         keyword_count += tokens.count(kw)
 
@@ -440,7 +258,6 @@ def compute_climate_metrics(text: str) -> Dict[str, float]:
 def iter_company_climate_rows(
     cik: str,
     static_info: Dict[str, str],
-    session: requests.Session,
 ) -> Iterable[Dict[str, object]]:
     """
     For a single company (identified by CIK), yield climate metric rows
@@ -448,9 +265,9 @@ def iter_company_climate_rows(
 
     static_info: dict with gvkey, company_name, tic, cusip, sic, naics, etc.
     """
+    session = make_sec_session()
     submissions = fetch_company_submissions(session, cik)
     if submissions is None:
-        # already logged; just skip this issuer
         return
 
     filings_10k = extract_10k_filings(submissions)
@@ -517,13 +334,15 @@ def load_issuer_master(path: str) -> Dict[str, Dict[str, str]]:
     df["cik_norm"] = cik_series
 
     cols = df.columns.tolist()
+    # ensure these exist; if not, fill with NA
     for col in ["gvkey", "company_name", "tic", "cusip", "sic", "naics"]:
         if col not in cols:
             df[col] = pd.NA
 
+    # keep one row per cik_norm
     df_unique = df.dropna(subset=["cik_norm"]).drop_duplicates(subset=["cik_norm"])
 
-    issuer_dict: Dict[str, Dict[str, str]] = {}
+    issuer_dict = {}
     for _, row in df_unique.iterrows():
         cik = row["cik_norm"]
         issuer_dict[cik] = {
@@ -540,23 +359,11 @@ def load_issuer_master(path: str) -> Dict[str, Dict[str, str]]:
 
 
 def main():
-    global CLIMATE_KEYWORDS
-
-    # 0. Load keyword list
-    CLIMATE_KEYWORDS = load_climate_keywords(CLIMATE_KEYWORD_PATH)
-
     # 1. Load issuer master into a small dict
     issuer_dict = load_issuer_master(ISSUER_MASTER_PATH)
     if not issuer_dict:
         print("[ERROR] No issuers found in issuer_master.")
         return
-
-    # 1.5 Create shared SEC session
-    session = make_sec_session()
-
-    # Time-ease timers
-    start_time = time.time()
-    last_pause_time = start_time
 
     # 2. Prepare writer
     ensure_dir(OUTPUT_METRICS_PATH)
@@ -594,33 +401,14 @@ def main():
         writer.writeheader()
 
         total_firms = len(issuer_dict)
-        try:
-            for idx, (cik, static_info) in enumerate(issuer_dict.items(), start=1):
-                print(f"\n[INFO] === Firm {idx}/{total_firms} | CIK {cik} ===")
-
-                # ---- time-ease check (every ~2 hours by default) ----
-                now = time.time()
-                if now - last_pause_time >= TIME_EASE_INTERVAL_SEC:
-                    elapsed = now - start_time
-                    print(
-                        f"[INFO] Time-ease: elapsed {elapsed/3600:.2f} hours "
-                        f"since start. Flushing and sleeping for {TIME_EASE_SLEEP_SEC} seconds..."
-                    )
-                    gzfile.flush()
-                    time.sleep(TIME_EASE_SLEEP_SEC)
-                    last_pause_time = time.time()
-                # ------------------------------------------------------
-
-                try:
-                    for row in iter_company_climate_rows(cik, static_info, session):
-                        writer.writerow(row)
-                except Exception as e:
-                    print(f"[ERROR] CIK {cik}: unexpected error {e}")
-                    continue
-        except RuntimeError as e:
-            # This is triggered if we hit too many 403s in a row on submissions
-            print(f"[ERROR] {e}")
-            print("[INFO] Stopping early to avoid hammering SEC; partial metrics file is still saved.")
+        for idx, (cik, static_info) in enumerate(issuer_dict.items(), start=1):
+            print(f"\n[INFO] === Firm {idx}/{total_firms} | CIK {cik} ===")
+            try:
+                for row in iter_company_climate_rows(cik, static_info):
+                    writer.writerow(row)
+            except Exception as e:
+                print(f"[ERROR] CIK {cik}: unexpected error {e}")
+                continue
 
     print(f"[INFO] Done. Climate metrics saved to {OUTPUT_METRICS_PATH}")
 
