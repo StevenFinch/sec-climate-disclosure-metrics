@@ -2,34 +2,31 @@
 """
 build_sec_climate_metrics.py
 
-Step 2: SEC 10-K climate disclosure metrics (resumable, chunked, with sentiment).
+- Input:  clean_data/issuer_master.csv
+          columns: cik, gvkey, company_name, tic, cusip, sic, naics (extra cols ignored)
+- Output (per run): clean_data/sec_climate_disclosure_metrics_XXXXX_YYYYY.csv.gz
+  where XXXXX = first firm index (1-based), YYYYY = last firm index (1-based)
 
-- Input: clean_data/issuer_master.csv (or .csv.gz)
-    columns: cik, gvkey, company_name, tic, cusip, sic, naics
+- Resume: uses clean_data/sec_climate_progress.json
+  {
+    "last_index": int (0-based index of last COMPLETED firm),
+    "total_firms": int,
+    "updated_at": "...",
+  }
 
-- For each unique CIK:
-    * download recent 10-K filings from SEC EDGAR
-    * extract a Risk Factors section (Item 1A) or full text
-    * compute:
-        - climate keyword / phrase metrics
-        - sentence-level climate sentiment (positive/negative/neutral)
+- Each run:
+  * Reads issuer_master
+  * Reads progress JSON (or starts from -1)
+  * Starts at last_index + 1
+  * Processes forward until (a) time limit or (b) firms exhausted
+  * Writes one new chunk file for that range
+  * Updates progress JSON after each firm
 
-- Output per run:
-    clean_data/sec_climate_disclosure_metrics_XXXXX_YYYYY.csv.gz
-
-    where XXXXX = first firm index (1-based) processed in this run,
-          YYYYY = last firm index (1-based) processed in this run.
-
-- Resume logic:
-    * Progress is tracked in clean_data/sec_climate_progress.json
-      with fields: last_index (0-based), total_firms, updated_at.
-    * Each run starts from last_index + 1 and moves forward.
-    * If no more firms, script exits quickly.
-
-IMPORTANT:
-- You must set SEC_CONTACT_EMAIL (or SEC_USER_AGENT) in env (we use
-  a generic UA with your email from GitHub Secrets).
-- Designed to be called repeatedly (e.g. via GitHub Actions every 2h).
+- Sentiment:
+  * Split risk-factor section into sentences
+  * Keep only sentences containing climate keywords
+  * Run HF sentiment model on those sentences
+  * Count pos/neg/neu + average sentiment score
 """
 
 import csv
@@ -45,7 +42,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-# Optional: HuggingFace transformers for sentiment
+# Optional sentiment model
 try:
     from transformers import pipeline
     HAVE_TRANSFORMERS = True
@@ -53,41 +50,27 @@ except ImportError:
     HAVE_TRANSFORMERS = False
 
 
-# ========== PATHS ANCHORED IN REPO ==========
+# ========== PATHS & CONFIG ==========
 
 BASE_DIR = Path(__file__).resolve().parent
 CLEAN_DATA_DIR = BASE_DIR / "clean_data"
 
-ISSUER_MASTER_PATH = CLEAN_DATA_DIR / "issuer_master.csv"  # or csv.gz
+ISSUER_MASTER_PATH = CLEAN_DATA_DIR / "issuer_master.csv"
 PROGRESS_PATH = CLEAN_DATA_DIR / "sec_climate_progress.json"
-
-# Chunked output files: sec_climate_disclosure_metrics_XXXXX_YYYYY.csv.gz
 SEC_CLIMATE_PREFIX = "sec_climate_disclosure_metrics"
 
-
-# ========== CONFIG ==========
-
-# Contact email from env (e.g. GitHub Secret)
 SEC_CONTACT_EMAIL = os.getenv("SEC_CONTACT_EMAIL", "research-contact@example.com")
 SEC_USER_AGENT = os.getenv(
     "SEC_USER_AGENT",
     f"AcademicResearchBot/1.0 (contact: {SEC_CONTACT_EMAIL})",
 )
 
-# Max number of 10-K filings per company
 MAX_10K_PER_COMPANY = 10
-
-# Gentle rate limiting
 SLEEP_BETWEEN_FILINGS_SEC = 0.3
 SLEEP_BETWEEN_COMPANIES_SEC = 0.5
-
-# Time-boxed run (per script invocation)
-MAX_RUNTIME_SECONDS = 7100  # ~2 hours
-
-# Stop if too many consecutive 403s from SEC
+MAX_RUNTIME_SECONDS = 7100           # ~2 hours
 MAX_CONSECUTIVE_403 = 20
 
-# Climate keywords (simple baseline)
 CLIMATE_KEYWORDS = [
     "climate",
     "emission",
@@ -107,7 +90,7 @@ WORD_REGEX = re.compile(r"[a-zA-Z]+")
 SENTENCE_SPLIT_REGEX = re.compile(r"(?<=[\.\?\!])\s+")
 
 
-# ========== BASIC HELPERS ==========
+# ========== HELPERS ==========
 
 def ensure_dir(p: Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -138,6 +121,7 @@ def fetch_company_submissions(
             return None
         else:
             state["consecutive_403"] = 0
+
         if resp.status_code != 200:
             print(f"[WARN] CIK {cik}: submissions.json status {resp.status_code}")
             return None
@@ -177,10 +161,7 @@ def extract_10k_filings(submissions: Dict) -> List[Dict]:
 def build_filing_url(cik: str, accession_number: str, primary_document: str) -> str:
     cik_int = int(cik)
     acc_no_digits = accession_number.replace("-", "")
-    return (
-        f"https://www.sec.gov/Archives/edgar/data/"
-        f"{cik_int}/{acc_no_digits}/{primary_document}"
-    )
+    return f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_no_digits}/{primary_document}"
 
 
 def fetch_filing_text(
@@ -232,28 +213,17 @@ def extract_risk_factor_section(full_text: str) -> str:
         return full_text[start_idx:]
 
 
-# ========== SENTIMENT PIPELINE ==========
+# ========== SENTIMENT ==========
 
 def build_sentiment_pipeline():
-    """
-    Use a generic sentiment model that actually produces pos/neg/neu.
-    Default: cardiffnlp/twitter-roberta-base-sentiment-latest
-    """
     if not HAVE_TRANSFORMERS:
         print("[WARN] transformers not installed -> sentiment disabled.")
         return None
 
-    model_name = os.getenv(
-        "SENTIMENT_MODEL_NAME",
-        "cardiffnlp/twitter-roberta-base-sentiment-latest",
-    )
+    model_name = os.getenv("SENTIMENT_MODEL_NAME", "yiyanghkust/finbert-tone")
     try:
         print(f"[INFO] Loading sentiment model: {model_name}")
-        clf = pipeline(
-            "sentiment-analysis",
-            model=model_name,
-            tokenizer=model_name,
-        )
+        clf = pipeline("sentiment-analysis", model=model_name, tokenizer=model_name)
         print("[INFO] Sentiment pipeline loaded.")
         return clf
     except Exception as e:
@@ -308,7 +278,7 @@ def compute_climate_sentiment(text: str, sentiment_pipe) -> Dict[str, float]:
 
     for r in results:
         label = (r.get("label") or "").lower()
-        # typical labels: "positive", "neutral", "negative" or "LABEL_0" etc
+        # FinBERT-tone labels: "positive", "negative", "neutral"
         if "pos" in label:
             pos += 1
             score_sum += 1.0
@@ -376,12 +346,9 @@ def compute_climate_metrics(text: str, sentiment_pipe=None) -> Dict[str, float]:
     return base
 
 
-# ========== PROGRESS HANDLING ==========
+# ========== PROGRESS & ISSUER MASTER ==========
 
 def load_progress(path: Path, total_firms: int) -> int:
-    """
-    Returns last_index (0-based). -1 if starting fresh.
-    """
     if not path.exists():
         print("[INFO] No progress file -> starting from first firm.")
         return -1
@@ -407,8 +374,6 @@ def save_progress(path: Path, last_index: int, total_firms: int) -> None:
     path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
     print(f"[INFO] Progress saved: last_index={last_index}/{total_firms - 1}")
 
-
-# ========== ISSUER MASTER LOADING ==========
 
 def load_issuer_master(path: Path) -> List[Tuple[str, Dict[str, str]]]:
     print(f"[INFO] Loading issuer master from {path} ...")
@@ -447,7 +412,7 @@ def load_issuer_master(path: Path) -> List[Tuple[str, Dict[str, str]]]:
     return rows
 
 
-# ========== COMPANY → FILINGS → ROWS ==========
+# ========== COMPANY → ROWS ==========
 
 def iter_company_climate_rows(
     cik: str,
@@ -466,4 +431,154 @@ def iter_company_climate_rows(
         return
 
     filings_10k = sorted(filings_10k, key=lambda x: x["filing_date"], reverse=True)
-    filings_10k = filings_10k[:MAX_10K_PER_C_]()
+    filings_10k = filings_10k[:MAX_10K_PER_COMPANY]
+
+    for f in filings_10k:
+        if state["consecutive_403"] >= MAX_CONSECUTIVE_403:
+            print("[ERROR] Too many consecutive 403s; stopping to avoid block.")
+            return
+
+        url = build_filing_url(cik, f["accession_number"], f["primary_document"])
+        print(f"[INFO] CIK {cik}: {f['form']} {f['accession_number']} {f['filing_date']}")
+        text = fetch_filing_text(session, url, state)
+        if text is None:
+            continue
+
+        section_text = extract_risk_factor_section(text)
+        metrics = compute_climate_metrics(section_text, sentiment_pipe)
+
+        row = {
+            "cik": cik.zfill(10),
+            "gvkey": static_info.get("gvkey"),
+            "company_name_master": static_info.get("company_name"),
+            "tic": static_info.get("tic"),
+            "cusip": static_info.get("cusip"),
+            "sic": static_info.get("sic"),
+            "naics": static_info.get("naics"),
+            "sec_company_name": f.get("company_name_sec", ""),
+            "form": f["form"],
+            "accession_number": f["accession_number"],
+            "filing_date": f["filing_date"],
+            "report_date": f.get("report_date", ""),
+            "primary_document": f["primary_document"],
+            "source_url": url,
+            "section_used": "item1a_or_full",
+        }
+        row.update(metrics)
+        yield row
+
+        time.sleep(SLEEP_BETWEEN_FILINGS_SEC)
+
+
+# ========== MAIN (ONE CHUNK) ==========
+
+def main():
+    start_time = time.monotonic()
+
+    issuer_list = load_issuer_master(ISSUER_MASTER_PATH)
+    total_firms = len(issuer_list)
+    if total_firms == 0:
+        print("[ERROR] No issuers found in issuer_master.")
+        return
+
+    last_index = load_progress(PROGRESS_PATH, total_firms)
+    start_index = last_index + 1
+
+    if start_index >= total_firms:
+        print("[INFO] All firms already processed according to progress file.")
+        return
+
+    sentiment_pipe = build_sentiment_pipeline()
+
+    chunk_start_idx = start_index
+    temp_path = CLEAN_DATA_DIR / f"{SEC_CLIMATE_PREFIX}_current.csv.gz"
+    ensure_dir(temp_path)
+
+    fieldnames = [
+        "cik",
+        "gvkey",
+        "company_name_master",
+        "tic",
+        "cusip",
+        "sic",
+        "naics",
+        "sec_company_name",
+        "form",
+        "accession_number",
+        "filing_date",
+        "report_date",
+        "primary_document",
+        "source_url",
+        "section_used",
+        "total_word_count",
+        "climate_keyword_count",
+        "climate_keyword_share",
+        "climate_phrase_count",
+        "climate_phrase_share",
+        "climate_sent_n_sents",
+        "climate_sent_pos_count",
+        "climate_sent_neg_count",
+        "climate_sent_neu_count",
+        "climate_sent_pos_share",
+        "climate_sent_neg_share",
+        "climate_sent_neu_share",
+        "climate_sent_score_avg",
+    ]
+
+    state = {"consecutive_403": 0}
+    last_completed = last_index
+    processed_any_firm = False
+
+    with gzip.open(temp_path, "wt", newline="", encoding="utf-8") as gzfile:
+        writer = csv.DictWriter(gzfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for idx in range(start_index, total_firms):
+            elapsed = time.monotonic() - start_time
+            if elapsed > MAX_RUNTIME_SECONDS:
+                print(f"[INFO] Time limit reached ({elapsed:.1f}s); stopping this run.")
+                break
+            if state["consecutive_403"] >= MAX_CONSECUTIVE_403:
+                print("[ERROR] Too many consecutive 403s; stopping run.")
+                break
+
+            cik, static_info = issuer_list[idx]
+            processed_any_firm = True
+            print(f"\n[INFO] === Firm {idx}/{total_firms - 1} | CIK {cik} ===")
+
+            try:
+                for row in iter_company_climate_rows(cik, static_info, state, sentiment_pipe):
+                    writer.writerow(row)
+                last_completed = idx
+                save_progress(PROGRESS_PATH, last_completed, total_firms)
+            except Exception as e:
+                print(f"[ERROR] CIK {cik}: unexpected error {e}")
+                last_completed = idx
+                save_progress(PROGRESS_PATH, last_completed, total_firms)
+
+            time.sleep(SLEEP_BETWEEN_COMPANIES_SEC)
+
+    if not processed_any_firm or last_completed < chunk_start_idx:
+        print("[INFO] No new firms processed this run; removing temp chunk.")
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+
+    start_human = chunk_start_idx + 1
+    end_human = last_completed + 1
+    final_name = f"{SEC_CLIMATE_PREFIX}_{start_human:05d}_{end_human:05d}.csv.gz"
+    final_path = CLEAN_DATA_DIR / final_name
+
+    if final_path.exists():
+        ts = int(time.time())
+        final_path = CLEAN_DATA_DIR / f"{SEC_CLIMATE_PREFIX}_{start_human:05d}_{end_human:05d}_{ts}.csv.gz"
+        print(f"[WARN] Final file existed; using {final_path.name}")
+
+    temp_path.rename(final_path)
+    print(f"[INFO] Saved chunk: {final_path}")
+
+
+if __name__ == "__main__":
+    main()
