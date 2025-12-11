@@ -29,8 +29,8 @@ build_sec_climate_metrics.py
   * Count pos/neg/neu + average sentiment score
 
 - Extra:
-  * New column climate_sentences: JSON list of sentences that contain
-    at least one climate keyword, based on the same filter used for sentiment.
+  * climate_sentences: JSON list of sentences that contain at least one
+    climate keyword (same set used for sentiment).
 """
 
 import csv
@@ -69,11 +69,16 @@ SEC_USER_AGENT = os.getenv(
     f"AcademicResearchBot/1.0 (contact: {SEC_CONTACT_EMAIL})",
 )
 
-MAX_10K_PER_COMPANY = 10
-SLEEP_BETWEEN_FILINGS_SEC = 0.3
+MAX_10K_PER_COMPANY = 1000
+SLEEP_BETWEEN_FILINGS_SEC = 0.5
 SLEEP_BETWEEN_COMPANIES_SEC = 0.5
 MAX_RUNTIME_SECONDS = 7100           # ~2 hours
 MAX_CONSECUTIVE_403 = 20
+
+# Filing-level retry config
+MAX_FILING_RETRIES = 5
+RETRY_BACKOFF_BASE_SEC = 2.0
+MAX_BACKOFF_SEC = 60.0
 
 CLIMATE_KEYWORDS = [
     "climate",
@@ -173,29 +178,69 @@ def fetch_filing_text(
     url: str,
     state: Dict[str, int],
 ) -> Optional[str]:
+    """
+    Robust fetch with retries and backoff.
+
+    - Retries on network-level errors and 5xx/429 up to MAX_FILING_RETRIES.
+    - 403 increments consecutive_403 and returns None (no retry) to avoid hammering.
+    """
     session.headers.update({"Host": "www.sec.gov"})
     try:
-        resp = session.get(url, timeout=60)
-        if resp.status_code == 403:
-            state["consecutive_403"] += 1
-            print(f"[WARN] Filing URL 403 (consecutive_403={state['consecutive_403']}): {url}")
-            return None
-        else:
-            state["consecutive_403"] = 0
+        for attempt in range(1, MAX_FILING_RETRIES + 1):
+            try:
+                resp = session.get(url, timeout=60)
+            except requests.exceptions.RequestException as e:
+                # Handles "response ended prematurely" and other network issues
+                print(f"[WARN] Filing URL {url} attempt {attempt}/{MAX_FILING_RETRIES} exception: {e}")
+                if attempt == MAX_FILING_RETRIES:
+                    print(f"[ERROR] Giving up on {url} after {MAX_FILING_RETRIES} exceptions.")
+                    return None
+                sleep = min(MAX_BACKOFF_SEC, RETRY_BACKOFF_BASE_SEC * attempt)
+                print(f"[INFO] Sleeping {sleep:.1f}s before retry...")
+                time.sleep(sleep)
+                continue
 
-        if resp.status_code != 200:
-            print(f"[WARN] Filing URL {url} status {resp.status_code}")
+            status = resp.status_code
+
+            # 403: treat as non-transient; don't retry to avoid being blocked.
+            if status == 403:
+                state["consecutive_403"] += 1
+                print(f"[WARN] Filing URL {url} 403 (consecutive_403={state['consecutive_403']})")
+                return None
+            else:
+                state["consecutive_403"] = 0
+
+            if status == 200:
+                text = resp.text
+                content_type = resp.headers.get("Content-Type", "").lower()
+                if "html" in content_type or "<html" in text.lower():
+                    soup = BeautifulSoup(text, "lxml")
+                    return soup.get_text(separator=" ", strip=True)
+                return text
+
+            # Temporary errors: 5xx / 429 -> backoff & retry
+            if status in (429, 500, 502, 503, 504):
+                print(f"[WARN] Filing URL {url} status {status} on attempt {attempt}/{MAX_FILING_RETRIES}")
+                if attempt == MAX_FILING_RETRIES:
+                    print(f"[ERROR] Giving up on {url} after {MAX_FILING_RETRIES} non-200 responses.")
+                    return None
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        sleep = float(retry_after)
+                    except ValueError:
+                        sleep = RETRY_BACKOFF_BASE_SEC * attempt
+                else:
+                    sleep = min(MAX_BACKOFF_SEC, RETRY_BACKOFF_BASE_SEC * attempt)
+                print(f"[INFO] Sleeping {sleep:.1f}s before retry...")
+                time.sleep(sleep)
+                continue
+
+            # Other non-200: log and give up (not obviously transient)
+            print(f"[WARN] Filing URL {url} unexpected status {status}; not retrying.")
             return None
 
-        text = resp.text
-        content_type = resp.headers.get("Content-Type", "").lower()
-        if "html" in content_type or "<html" in text.lower():
-            soup = BeautifulSoup(text, "lxml")
-            return soup.get_text(separator=" ", strip=True)
-        else:
-            return text
-    except Exception as e:
-        print(f"[ERROR] Filing URL {url}: error {e}")
+        # Should never reach here
         return None
     finally:
         session.headers.update({"Host": "data.sec.gov"})
@@ -464,7 +509,7 @@ def iter_company_climate_rows(
         section_text = extract_risk_factor_section(text)
         metrics = compute_climate_metrics(section_text, sentiment_pipe)
 
-        # NEW: capture the exact sentences that contain climate keywords
+        # Capture the exact sentences that contain climate keywords
         climate_sents = extract_climate_sentences(section_text)
         climate_sents_str = json.dumps(climate_sents, ensure_ascii=False)
 
@@ -545,7 +590,7 @@ def main():
         "climate_sent_neg_share",
         "climate_sent_neu_share",
         "climate_sent_score_avg",
-        "climate_sentences",   # NEW COLUMN
+        "climate_sentences",
     ]
 
     state = {"consecutive_403": 0}
