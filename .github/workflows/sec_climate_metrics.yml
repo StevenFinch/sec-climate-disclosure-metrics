@@ -18,9 +18,9 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Secret contact email -> SEC_USER_AGENT built inside the script
+      # Secret contact email; script will build SEC_USER_AGENT from this
       SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
-      # Optional: override entire UA if you want
+      # Optional: override whole UA if you want
       # SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
 
     steps:
@@ -44,53 +44,29 @@ jobs:
             pip install pandas requests beautifulsoup4 lxml transformers
           fi
 
-      - name: Run SEC climate metrics pipeline (resumable, up to 3 chunks)
+      - name: Run SEC climate metrics pipeline (one chunk, resumable)
         run: |
-          set -e
-
-          # Run up to 3 times in one workflow run
-          for i in 1 2 3
-          do
-            echo "=== Chunk run $i ==="
-            python build_sec_climate_metrics.py
-
-            # Check if all firms are done; if yes, break early
-            python - << 'PY'
-import json, pathlib, sys
-p = pathlib.Path("clean_data/sec_climate_progress.json")
-if not p.exists():
-    sys.exit(1)  # not done yet
-j = json.loads(p.read_text(encoding="utf-8"))
-last_index = j.get("last_index", -1)
-total_firms = j.get("total_firms", 0)
-if total_firms and last_index >= total_firms - 1:
-    print("All firms processed; stop loop.")
-    sys.exit(0)  # signal "done"
-sys.exit(1)      # not done
-PY
-            if [ $? -eq 0 ]; then
-              break
-            fi
-          done
+          python build_sec_climate_metrics.py
 
       - name: Upload latest chunk(s) as artifact
         uses: actions/upload-artifact@v4
         with:
           name: sec_climate_disclosure_metrics_chunks
           path: clean_data/sec_climate_disclosure_metrics_*.csv.gz
+          if-no-files-found: ignore
 
       - name: Commit updated metrics and progress
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Force-add data even if .gitignore ignores clean_data/
+          # Force-add even if .gitignore is ignoring clean_data/
           git add -f clean_data/sec_climate_disclosure_metrics_*.csv.gz \
                     clean_data/sec_climate_progress.json || echo "Nothing to add"
 
           if git diff --cached --quiet; then
             echo "No changes to commit"
-          else:
+          else
             git commit -m "Update SEC climate disclosure metrics [skip ci]"
             git push || echo "No changes pushed"
           fi
