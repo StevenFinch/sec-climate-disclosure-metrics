@@ -9,23 +9,26 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sec-climate-metrics
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
-    # Environment variables passed into the script
     env:
-      # Secret contact email used by the script to build SEC_USER_AGENT
+      # Secret contact email -> SEC_USER_AGENT built inside the script
       SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
-      # Optional: if you want to override the whole UA instead of just email:
+      # Optional: override entire UA if you want
       # SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          persist-credentials: true   # needed to push changes
-          fetch-depth: 0              # safer for commits
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -41,31 +44,53 @@ jobs:
             pip install pandas requests beautifulsoup4 lxml transformers
           fi
 
-      - name: Run SEC climate metrics pipeline (resumable)
+      - name: Run SEC climate metrics pipeline (resumable, up to 3 chunks)
         run: |
-          # If your script is in scripts/, adjust the path accordingly:
-          # python scripts/build_sec_climate_metrics.py
-          python build_sec_climate_metrics.py
+          set -e
 
-      - name: Upload metrics as artifact
+          # Run up to 3 times in one workflow run
+          for i in 1 2 3
+          do
+            echo "=== Chunk run $i ==="
+            python build_sec_climate_metrics.py
+
+            # Check if all firms are done; if yes, break early
+            python - << 'PY'
+import json, pathlib, sys
+p = pathlib.Path("clean_data/sec_climate_progress.json")
+if not p.exists():
+    sys.exit(1)  # not done yet
+j = json.loads(p.read_text(encoding="utf-8"))
+last_index = j.get("last_index", -1)
+total_firms = j.get("total_firms", 0)
+if total_firms and last_index >= total_firms - 1:
+    print("All firms processed; stop loop.")
+    sys.exit(0)  # signal "done"
+sys.exit(1)      # not done
+PY
+            if [ $? -eq 0 ]; then
+              break
+            fi
+          done
+
+      - name: Upload latest chunk(s) as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sec_climate_disclosure_metrics
-          path: clean_data/sec_climate_disclosure_metrics.csv.gz
+          name: sec_climate_disclosure_metrics_chunks
+          path: clean_data/sec_climate_disclosure_metrics_*.csv.gz
 
       - name: Commit updated metrics and progress
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Add both the metrics AND the progress JSON
-          git add clean_data/sec_climate_disclosure_metrics.csv.gz \
-                  clean_data/sec_climate_progress.json || echo "Nothing to add"
+          # Force-add data even if .gitignore ignores clean_data/
+          git add -f clean_data/sec_climate_disclosure_metrics_*.csv.gz \
+                    clean_data/sec_climate_progress.json || echo "Nothing to add"
 
-          # Commit only if there are staged changes
           if git diff --cached --quiet; then
             echo "No changes to commit"
-          else
+          else:
             git commit -m "Update SEC climate disclosure metrics [skip ci]"
             git push || echo "No changes pushed"
           fi
