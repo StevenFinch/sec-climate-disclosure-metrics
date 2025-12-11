@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-build_sec_climate_metrics_resumable.py
+build_sec_climate_metrics_resumable_sentiment.py
 
-Step 2 (resumable version):
+Step 2 (resumable + sentiment):
 - Read issuer_master.csv (or .csv.gz), which contains:
     cik, gvkey, company_name, tic, cusip, sic, naics
 - For each unique CIK, download recent 10-K filings from SEC EDGAR.
-- Extract a simple risk-factor section and compute climate text metrics.
-- Stream results into a slim gzipped CSV:
+- Extract a simple risk-factor section and compute:
+    * climate-related text metrics
+    * climate-related sentiment metrics (FinBERT or similar, if available)
+- Stream results into:
     clean_data/sec_climate_disclosure_metrics.csv.gz
 
 Features:
 - Resumable: keeps a progress JSON with the last fully processed firm index.
 - Time-boxed: stops after MAX_RUNTIME_SECONDS (~2h) so you can run via cron/GitHub Actions.
 - Gentle rate limit: per-filing sleep, per-company sleep, and a stop after too many 403s.
+- Optional FinBERT sentiment: if transformers / model are unavailable, gracefully falls back.
 
 IMPORTANT:
-- Set SEC_USER_AGENT to your own info (name + affiliation + email).
+- Set SEC_USER_AGENT to your info (name + affiliation + email).
+- If using FinBERT, install `transformers` and download the model once.
 """
 
 import csv
@@ -32,33 +36,49 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+# ---------- OPTIONAL: sentiment model (FinBERT or similar) ----------
+
+try:
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+    HAVE_TRANSFORMERS = True
+except ImportError:
+    HAVE_TRANSFORMERS = False
+
 
 # ========== CONFIG (EDIT THESE) ==========
 
 # Path to issuer master (step 1 output)
 ISSUER_MASTER_PATH = "clean_data/issuer_master.csv"  # or ".csv.gz"
 
-# Output metrics (gzipped CSV)
+# Output metrics (gzipped CSV) - stored inside repo
 OUTPUT_METRICS_PATH = "clean_data/sec_climate_disclosure_metrics.csv.gz"
 
-# Progress file (JSON)
+# Progress file (JSON) - stored inside repo
 PROGRESS_PATH = "clean_data/sec_climate_progress.json"
 
-# SEC requires a descriptive User-Agent. CHANGE THIS.
-SEC_USER_AGENT = "Sirui Zhao Cornell University sz695@cornell.edu"
+# Contact email comes from env (e.g. GitHub secret SEC_CONTACT_EMAIL)
+SEC_CONTACT_EMAIL = os.getenv("SEC_CONTACT_EMAIL", "research-contact@example.com")
+
+# If you want to override whole UA, you can set SEC_USER_AGENT directly in env.
+# Otherwise we construct a generic but compliant one that uses the secret email.
+SEC_USER_AGENT = os.getenv(
+    "SEC_USER_AGENT",
+    f"AcademicResearchBot/1.0 (contact: {SEC_CONTACT_EMAIL})",
+)
 
 # Max number of 10-K filings per company to process
-MAX_10K_PER_COMPANY = 10
+MAX_10K_PER_COMPANY = 1000
 
 # Small sleeps to avoid hammering SEC
 SLEEP_BETWEEN_FILINGS_SEC = 0.3
 SLEEP_BETWEEN_COMPANIES_SEC = 0.5
 
-# Time-boxed run: stop after this many seconds (2h = 7200; use a bit less to be safe)
+# Time-boxed run: stop after this many seconds (≈ 2h)
 MAX_RUNTIME_SECONDS = 7100
 
 # Stop entirely if we hit too many consecutive 403s (likely blocked)
 MAX_CONSECUTIVE_403 = 20
+
 
 # Climate-related keywords / phrases (simple baseline; refine later)
 CLIMATE_KEYWORDS = [
@@ -234,18 +254,133 @@ def extract_risk_factor_section(full_text: str) -> str:
         return full_text[start_idx:]
 
 
-def compute_climate_metrics(text: str) -> Dict[str, float]:
+# ========== SENTENCE-LEVEL CLIMATE SENTIMENT ==========
+
+SENTENCE_SPLIT_REGEX = re.compile(r"(?<=[\.\?\!])\s+")
+
+def build_sentiment_pipeline():
     """
-    Compute simple climate-related metrics from a block of text.
+    Build a HF sentiment-analysis pipeline (FinBERT or similar).
+    Return None if transformers not available or if env USE_FINBERT == "0".
+    """
+    use_finbert = os.getenv("USE_FINBERT", "1")  # "1" by default
+    if use_finbert == "0":
+        print("[INFO] USE_FINBERT=0 -> sentiment disabled.")
+        return None
+
+    if not HAVE_TRANSFORMERS:
+        print("[WARN] transformers not installed -> sentiment disabled.")
+        return None
+
+    model_name = os.getenv("FINBERT_MODEL_NAME", "ProsusAI/finbert")
+    print(f"[INFO] Loading sentiment model: {model_name}")
+    try:
+        clf = pipeline(
+            "sentiment-analysis",
+            model=model_name,
+            tokenizer=model_name,
+        )
+        print("[INFO] Sentiment pipeline loaded successfully.")
+        return clf
+    except Exception as e:
+        print(f"[WARN] Failed to load sentiment model ({e}) -> sentiment disabled.")
+        return None
+
+
+def compute_climate_sentiment(text: str, sentiment_pipe) -> Dict[str, float]:
+    """
+    Given the full risk-factor text and a sentiment pipeline,
+    compute sentiment metrics on sentences that contain any climate keyword.
+    """
+    if (sentiment_pipe is None) or (not text):
+        return {
+            "climate_sent_n_sents": 0,
+            "climate_sent_pos_count": 0,
+            "climate_sent_neg_count": 0,
+            "climate_sent_neu_count": 0,
+            "climate_sent_pos_share": 0.0,
+            "climate_sent_neg_share": 0.0,
+            "climate_sent_neu_share": 0.0,
+            "climate_sent_score_avg": 0.0,
+        }
+
+    # Split into sentences (very simple regex, good enough for 10-K)
+    sentences = SENTENCE_SPLIT_REGEX.split(text)
+    climate_sents = []
+    for s in sentences:
+        s_low = s.lower()
+        if any(kw in s_low for kw in CLIMATE_KEYWORDS):
+            if len(s.strip()) > 0:
+                climate_sents.append(s.strip())
+
+    n = len(climate_sents)
+    if n == 0:
+        return {
+            "climate_sent_n_sents": 0,
+            "climate_sent_pos_count": 0,
+            "climate_sent_neg_count": 0,
+            "climate_sent_neu_count": 0,
+            "climate_sent_pos_share": 0.0,
+            "climate_sent_neg_share": 0.0,
+            "climate_sent_neu_share": 0.0,
+            "climate_sent_score_avg": 0.0,
+        }
+
+    # Run sentiment on climate sentences (batch)
+    # To keep things safe, truncate to 256 tokens per sentence
+    results = sentiment_pipe(
+        climate_sents,
+        truncation=True,
+        max_length=256,
+    )
+
+    pos = neg = neu = 0
+    score_sum = 0.0
+
+    for r in results:
+        label = (r.get("label") or "").lower()
+        # Map label to pos/neg/neu and a numeric score
+        if "pos" in label:
+            pos += 1
+            score_sum += 1.0
+        elif "neg" in label:
+            neg += 1
+            score_sum -= 1.0
+        else:
+            neu += 1
+            # neutral -> 0
+
+    pos_share = pos / n
+    neg_share = neg / n
+    neu_share = neu / n
+    avg_score = score_sum / n
+
+    return {
+        "climate_sent_n_sents": n,
+        "climate_sent_pos_count": pos,
+        "climate_sent_neg_count": neg,
+        "climate_sent_neu_count": neu,
+        "climate_sent_pos_share": pos_share,
+        "climate_sent_neg_share": neg_share,
+        "climate_sent_neu_share": neu_share,
+        "climate_sent_score_avg": avg_score,
+    }
+
+
+def compute_climate_metrics(text: str, sentiment_pipe=None) -> Dict[str, float]:
+    """
+    Compute climate keyword/phrase metrics + (optionally) climate sentiment metrics.
     """
     if not text:
-        return {
+        base = {
             "total_word_count": 0,
             "climate_keyword_count": 0,
             "climate_keyword_share": 0.0,
             "climate_phrase_count": 0,
             "climate_phrase_share": 0.0,
         }
+        base.update(compute_climate_sentiment("", sentiment_pipe))
+        return base
 
     text_lower = text.lower()
     tokens = WORD_REGEX.findall(text_lower)
@@ -269,13 +404,17 @@ def compute_climate_metrics(text: str) -> Dict[str, float]:
         keyword_share = 0.0
         phrase_share = 0.0
 
-    return {
+    base = {
         "total_word_count": total_words,
         "climate_keyword_count": keyword_count,
         "climate_keyword_share": keyword_share,
         "climate_phrase_count": phrase_count,
         "climate_phrase_share": phrase_share,
     }
+
+    sent_metrics = compute_climate_sentiment(text, sentiment_pipe)
+    base.update(sent_metrics)
+    return base
 
 
 # ========== PROGRESS HANDLING ==========
@@ -333,7 +472,6 @@ def load_issuer_master(path: str) -> List[Tuple[str, Dict[str, str]]]:
     cik_series = cik_series.apply(lambda x: x.zfill(10)[-10:] if x else x)
     df["cik_norm"] = cik_series
 
-    # ensure expected cols exist
     for col in ["gvkey", "company_name", "tic", "cusip", "sic", "naics"]:
         if col not in df.columns:
             df[col] = pd.NA
@@ -352,7 +490,6 @@ def load_issuer_master(path: str) -> List[Tuple[str, Dict[str, str]]]:
         }
         rows.append((cik, static_info))
 
-    # stable order by cik
     rows.sort(key=lambda x: x[0])
     print(f"[INFO] Loaded {len(rows)} unique issuers from issuer_master.")
     return rows
@@ -364,6 +501,7 @@ def iter_company_climate_rows(
     cik: str,
     static_info: Dict[str, str],
     state: Dict[str, int],
+    sentiment_pipe,
 ) -> Iterable[Dict[str, object]]:
     """
     For a single company (identified by CIK), yield climate metric rows
@@ -394,10 +532,9 @@ def iter_company_climate_rows(
             continue
 
         section_text = extract_risk_factor_section(text)
-        metrics = compute_climate_metrics(section_text)
+        metrics = compute_climate_metrics(section_text, sentiment_pipe)
 
         row = {
-            # IDs from issuer master
             "cik": cik.zfill(10),
             "gvkey": static_info.get("gvkey"),
             "company_name_master": static_info.get("company_name"),
@@ -405,8 +542,6 @@ def iter_company_climate_rows(
             "cusip": static_info.get("cusip"),
             "sic": static_info.get("sic"),
             "naics": static_info.get("naics"),
-
-            # SEC info
             "sec_company_name": f.get("company_name_sec", ""),
             "form": f["form"],
             "accession_number": f["accession_number"],
@@ -441,7 +576,10 @@ def main():
         print("[INFO] All firms already processed according to progress file.")
         return
 
-    # 3. Prepare gzipped output (append if exists, else write header)
+    # 3. Try to load sentiment pipeline (FinBERT / similar)
+    sentiment_pipe = build_sentiment_pipeline()
+
+    # 4. Prepare gzipped output (append if exists, else write header)
     ensure_dir(OUTPUT_METRICS_PATH)
     file_exists = os.path.exists(OUTPUT_METRICS_PATH)
 
@@ -466,6 +604,14 @@ def main():
         "climate_keyword_share",
         "climate_phrase_count",
         "climate_phrase_share",
+        "climate_sent_n_sents",
+        "climate_sent_pos_count",
+        "climate_sent_neg_count",
+        "climate_sent_neu_count",
+        "climate_sent_pos_share",
+        "climate_sent_neg_share",
+        "climate_sent_neu_share",
+        "climate_sent_score_avg",
     ]
 
     mode = "at" if file_exists else "wt"
@@ -477,7 +623,7 @@ def main():
         state = {"consecutive_403": 0}
         last_completed = last_index
 
-        # 4. Iterate starting from start_index
+        # 5. Iterate starting from start_index
         for idx in range(start_index, total_firms):
             cik, static_info = issuer_list[idx]
 
@@ -493,10 +639,8 @@ def main():
             print(f"\n[INFO] === Firm {idx}/{total_firms - 1} | CIK {cik} ===")
 
             try:
-                any_row = False
-                for row in iter_company_climate_rows(cik, static_info, state):
+                for row in iter_company_climate_rows(cik, static_info, state, sentiment_pipe):
                     writer.writerow(row)
-                    any_row = True
 
                 # mark firm as completed regardless of whether we got filings
                 last_completed = idx
@@ -504,7 +648,6 @@ def main():
 
             except Exception as e:
                 print(f"[ERROR] CIK {cik}: unexpected error {e}")
-                # still mark this firm as "done" to avoid infinite retry loops
                 last_completed = idx
                 save_progress(PROGRESS_PATH, last_completed, total_firms)
 
