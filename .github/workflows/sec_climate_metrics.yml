@@ -1,10 +1,10 @@
 name: Build SEC climate disclosure metrics
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    # Every day at 06:00 UTC; adjust as desired
-    - cron: "0 6 * * *"
+    # Every 2 hours (UTC)
+    - cron: "0 */2 * * *"
 
 permissions:
   contents: write
@@ -13,9 +13,19 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    # Environment variables passed into the script
+    env:
+      # Secret contact email used by the script to build SEC_USER_AGENT
+      SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
+      # Optional: if you want to override the whole UA instead of just email:
+      # SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true   # needed to push changes
+          fetch-depth: 0              # safer for commits
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,14 +35,16 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install -U pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas requests beautifulsoup4 lxml transformers
+          fi
 
-      - name: Run SEC climate metrics pipeline
-        env:
-          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
-          ISSUER_MASTER_PATH: clean_data/issuer_master.csv
-          OUTPUT_METRICS_PATH: clean_data/sec_climate_disclosure_metrics.csv.gz
+      - name: Run SEC climate metrics pipeline (resumable)
         run: |
+          # If your script is in scripts/, adjust the path accordingly:
+          # python scripts/build_sec_climate_metrics.py
           python build_sec_climate_metrics.py
 
       - name: Upload metrics as artifact
@@ -41,10 +53,19 @@ jobs:
           name: sec_climate_disclosure_metrics
           path: clean_data/sec_climate_disclosure_metrics.csv.gz
 
-      - name: Commit updated metrics (optional)
+      - name: Commit updated metrics and progress
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add clean_data/sec_climate_disclosure_metrics.csv.gz || true
-          git commit -m "Update SEC climate disclosure metrics [skip ci]" || echo "No changes to commit"
-          git push || echo "No changes pushed"
+
+          # Add both the metrics AND the progress JSON
+          git add clean_data/sec_climate_disclosure_metrics.csv.gz \
+                  clean_data/sec_climate_progress.json || echo "Nothing to add"
+
+          # Commit only if there are staged changes
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update SEC climate disclosure metrics [skip ci]"
+            git push || echo "No changes pushed"
+          fi
