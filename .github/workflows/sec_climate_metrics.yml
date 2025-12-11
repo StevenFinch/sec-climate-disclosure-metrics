@@ -18,9 +18,9 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Secret contact email; script will build SEC_USER_AGENT from this
+      # Email is taken from a GitHub Secret so it never appears in the repo
       SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
-      # Optional: override whole UA if you want
+      # Optional: override full UA if desired
       # SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
 
     steps:
@@ -44,9 +44,19 @@ jobs:
             pip install pandas requests beautifulsoup4 lxml transformers
           fi
 
-      - name: Run SEC climate metrics pipeline (one chunk, resumable)
+      - name: Run SEC climate metrics pipeline (up to 3 chunks per job)
         run: |
-          python build_sec_climate_metrics.py
+          set -e
+          for i in 1 2 3
+          do
+            echo "=== SEC climate run $i ==="
+            python build_sec_climate_metrics.py
+          done
+
+      - name: List clean_data contents (debug)
+        run: |
+          ls -R
+          ls -l clean_data || echo "clean_data not found"
 
       - name: Upload latest chunk(s) as artifact
         uses: actions/upload-artifact@v4
@@ -60,7 +70,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Force-add even if .gitignore is ignoring clean_data/
+          # Force-add even if clean_data/ is ignored
           git add -f clean_data/sec_climate_disclosure_metrics_*.csv.gz \
                     clean_data/sec_climate_progress.json || echo "Nothing to add"
 
