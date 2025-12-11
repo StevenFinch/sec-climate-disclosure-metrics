@@ -27,6 +27,10 @@ build_sec_climate_metrics.py
   * Keep only sentences containing climate keywords
   * Run HF sentiment model on those sentences
   * Count pos/neg/neu + average sentiment score
+
+- Extra:
+  * New column climate_sentences: JSON list of sentences that contain
+    at least one climate keyword, based on the same filter used for sentiment.
 """
 
 import csv
@@ -213,7 +217,27 @@ def extract_risk_factor_section(full_text: str) -> str:
         return full_text[start_idx:]
 
 
-# ========== SENTIMENT ==========
+# ========== SENTIMENT & CLIMATE SENTENCES ==========
+
+def extract_climate_sentences(text: str) -> List[str]:
+    """
+    Extract all sentences that contain at least one climate keyword.
+    Sentences are stripped of leading/trailing whitespace.
+    """
+    if not text:
+        return []
+
+    sentences = SENTENCE_SPLIT_REGEX.split(text)
+    climate_sents: List[str] = []
+    for s in sentences:
+        s_stripped = s.strip()
+        if not s_stripped:
+            continue
+        s_low = s_stripped.lower()
+        if any(kw in s_low for kw in CLIMATE_KEYWORDS):
+            climate_sents.append(s_stripped)
+    return climate_sents
+
 
 def build_sentiment_pipeline():
     if not HAVE_TRANSFORMERS:
@@ -244,15 +268,8 @@ def compute_climate_sentiment(text: str, sentiment_pipe) -> Dict[str, float]:
             "climate_sent_score_avg": 0.0,
         }
 
-    sentences = SENTENCE_SPLIT_REGEX.split(text)
-    climate_sents = []
-    for s in sentences:
-        s_stripped = s.strip()
-        if not s_stripped:
-            continue
-        s_low = s_stripped.lower()
-        if any(kw in s_low for kw in CLIMATE_KEYWORDS):
-            climate_sents.append(s_stripped)
+    # Use the same sentence set everywhere (also used for saving to column)
+    climate_sents = extract_climate_sentences(text)
 
     n = len(climate_sents)
     if n == 0:
@@ -447,6 +464,10 @@ def iter_company_climate_rows(
         section_text = extract_risk_factor_section(text)
         metrics = compute_climate_metrics(section_text, sentiment_pipe)
 
+        # NEW: capture the exact sentences that contain climate keywords
+        climate_sents = extract_climate_sentences(section_text)
+        climate_sents_str = json.dumps(climate_sents, ensure_ascii=False)
+
         row = {
             "cik": cik.zfill(10),
             "gvkey": static_info.get("gvkey"),
@@ -463,6 +484,7 @@ def iter_company_climate_rows(
             "primary_document": f["primary_document"],
             "source_url": url,
             "section_used": "item1a_or_full",
+            "climate_sentences": climate_sents_str,
         }
         row.update(metrics)
         yield row
@@ -523,6 +545,7 @@ def main():
         "climate_sent_neg_share",
         "climate_sent_neu_share",
         "climate_sent_score_avg",
+        "climate_sentences",   # NEW COLUMN
     ]
 
     state = {"consecutive_403": 0}
